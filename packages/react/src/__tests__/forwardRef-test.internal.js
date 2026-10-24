@@ -14,6 +14,7 @@ describe('forwardRef', () => {
   let ReactNoop;
   let Scheduler;
   let waitForAll;
+  let act;
 
   beforeEach(() => {
     jest.resetModules();
@@ -24,6 +25,249 @@ describe('forwardRef', () => {
 
     const InternalTestUtils = require('internal-test-utils');
     waitForAll = InternalTestUtils.waitForAll;
+    act = InternalTestUtils.act;
+  });
+
+  ['object', 'callback', 'null', 'undefined', 'omitted'].forEach(refType => {
+    it(
+      'should preserve props identity during state updates with ' +
+        refType +
+        ' ref',
+      async () => {
+        let setCount;
+        const receivedProps = [];
+        const Child = React.memo(function Child({parentProps}) {
+          Scheduler.log('Child');
+          return parentProps.label;
+        });
+        const Component = React.forwardRef((props, ref) => {
+          const [count, _setCount] = React.useState(0);
+          setCount = _setCount;
+          receivedProps.push(props);
+          React.useMemo(() => {
+            Scheduler.log('Memo');
+            return props.label;
+          }, [props]);
+          Scheduler.log('Count: ' + count);
+          return <Child parentProps={props} />;
+        });
+        const props = {label: 'stable'};
+        switch (refType) {
+          case 'object':
+            props.ref = React.createRef();
+            break;
+          case 'callback':
+            props.ref = () => {};
+            break;
+          case 'null':
+            props.ref = null;
+            break;
+          case 'undefined':
+            props.ref = undefined;
+            break;
+        }
+
+        ReactNoop.render(React.createElement(Component, props));
+        await waitForAll(['Memo', 'Count: 0', 'Child']);
+
+        for (let count = 1; count <= 2; count++) {
+          setCount(count);
+          await waitForAll(['Count: ' + count]);
+          expect(receivedProps[count]).toBe(receivedProps[0]);
+          expect(receivedProps[count]).not.toHaveProperty('ref');
+        }
+      },
+    );
+  });
+
+  it('should use new props from the parent and support reusing an earlier element', async () => {
+    const receivedProps = [];
+    const Component = React.forwardRef((props, ref) => {
+      receivedProps.push(props);
+      React.useMemo(() => {
+        Scheduler.log('Memo: ' + props.label);
+        return props.label;
+      }, [props]);
+      return props.label;
+    });
+    const ref = React.createRef();
+    const firstElement = <Component ref={ref} label="first" />;
+
+    ReactNoop.render(firstElement);
+    await waitForAll(['Memo: first']);
+    expect(ReactNoop).toMatchRenderedOutput('first');
+
+    // Even equal parent props are a distinct input, as with function components.
+    ReactNoop.render(<Component ref={ref} label="first" />);
+    await waitForAll(['Memo: first']);
+    expect(receivedProps[1]).not.toBe(receivedProps[0]);
+
+    ReactNoop.render(<Component ref={ref} label="second" />);
+    await waitForAll(['Memo: second']);
+    expect(ReactNoop).toMatchRenderedOutput('second');
+    expect(receivedProps[2]).not.toBe(receivedProps[1]);
+    expect(receivedProps[0].label).toBe('first');
+
+    ReactNoop.render(firstElement);
+    await waitForAll(['Memo: first']);
+    expect(ReactNoop).toMatchRenderedOutput('first');
+    expect(receivedProps[3]).toBe(receivedProps[0]);
+  });
+
+  it('should preserve props for state updates inside memo and update changed refs', async () => {
+    let setCount;
+    const receivedProps = [];
+    const Component = React.memo(
+      React.forwardRef((props, ref) => {
+        const [count, _setCount] = React.useState(0);
+        setCount = _setCount;
+        receivedProps.push(props);
+        React.useImperativeHandle(ref, () => ({count}), [count]);
+        return props.label + ': ' + count;
+      }),
+    );
+    const firstRef = React.createRef();
+    const secondRef = React.createRef();
+
+    await act(() => {
+      ReactNoop.render(<Component ref={firstRef} label="stable" />);
+    });
+    expect(firstRef.current).toEqual({count: 0});
+
+    await act(() => setCount(1));
+    expect(receivedProps[1]).toBe(receivedProps[0]);
+    expect(firstRef.current).toEqual({count: 1});
+
+    await act(() => {
+      ReactNoop.render(<Component ref={secondRef} label="stable" />);
+    });
+    expect(firstRef.current).toBe(null);
+    expect(secondRef.current).toEqual({count: 1});
+    expect(receivedProps[2]).not.toBe(receivedProps[1]);
+    expect(receivedProps[2]).not.toHaveProperty('ref');
+
+    await act(() => setCount(2));
+    expect(receivedProps[3]).toBe(receivedProps[2]);
+    expect(secondRef.current).toEqual({count: 2});
+    expect(ReactNoop).toMatchRenderedOutput('stable: 2');
+
+    // A parent update with equal props and the same ref still bails out.
+    await act(() => {
+      ReactNoop.render(<Component ref={secondRef} label="stable" />);
+    });
+    expect(receivedProps).toHaveLength(4);
+  });
+
+  it('should preserve props through strict mode and render-phase updates', async () => {
+    let setCount;
+    const receivedProps = [];
+    const Component = React.forwardRef((props, ref) => {
+      const [count, _setCount] = React.useState(0);
+      setCount = _setCount;
+      receivedProps.push(props);
+      if (count < 2) {
+        setCount(count + 1);
+      }
+      return count;
+    });
+
+    await act(() => {
+      ReactNoop.render(
+        <React.StrictMode>
+          <Component ref={React.createRef()} />
+        </React.StrictMode>,
+      );
+    });
+    expect(ReactNoop).toMatchRenderedOutput('2');
+
+    await act(() => setCount(3));
+    expect(ReactNoop).toMatchRenderedOutput('3');
+    receivedProps.forEach(props => {
+      expect(props).toBe(receivedProps[0]);
+      expect(props).not.toHaveProperty('ref');
+    });
+  });
+
+  it('should reuse props without ref when replaying a suspended component', async () => {
+    let setCount;
+    const receivedProps = [];
+    const promise = Promise.resolve('ready');
+    const Component = React.forwardRef((props, ref) => {
+      const [count, _setCount] = React.useState(0);
+      setCount = _setCount;
+      receivedProps.push(props);
+      const value = React.use(promise);
+      React.useImperativeHandle(ref, () => ({value, count}), [value, count]);
+      return value + ': ' + count;
+    });
+    const ref = React.createRef();
+    const root = ReactNoop.createRoot();
+
+    await act(() => {
+      React.startTransition(() => root.render(<Component ref={ref} />));
+    });
+    expect(root).toMatchRenderedOutput('ready: 0');
+    expect(receivedProps.length).toBeGreaterThan(1);
+    expect(ref.current).toEqual({value: 'ready', count: 0});
+
+    await act(() => setCount(1));
+    expect(root).toMatchRenderedOutput('ready: 1');
+    expect(ref.current).toEqual({value: 'ready', count: 1});
+    receivedProps.forEach(props => {
+      expect(props).toBe(receivedProps[0]);
+      expect(props).not.toHaveProperty('ref');
+    });
+  });
+
+  it('should keep committed props stable when a different parent update suspends', async () => {
+    let setCount;
+    const attemptedLabels = [];
+    const committedProps = [];
+    const pending = new Promise(() => {});
+    const Component = React.forwardRef((props, ref) => {
+      const [count, _setCount] = React.useState(0);
+      setCount = _setCount;
+      attemptedLabels.push(props.label);
+      React.useLayoutEffect(() => {
+        committedProps.push(props);
+      });
+      if (props.suspend) {
+        throw pending;
+      }
+      return props.label + ': ' + count;
+    });
+    const ref = React.createRef();
+    const root = ReactNoop.createRoot();
+    function render(label, suspend) {
+      return (
+        <React.Suspense fallback="Loading">
+          <Component ref={ref} label={label} suspend={suspend} />
+        </React.Suspense>
+      );
+    }
+
+    await act(() => root.render(render('first', false)));
+    expect(root).toMatchRenderedOutput('first: 0');
+    const initialProps = committedProps[0];
+
+    await act(() => {
+      React.startTransition(() => root.render(render('pending', true)));
+    });
+    expect(attemptedLabels).toContain('pending');
+    expect(root).toMatchRenderedOutput('first: 0');
+    expect(committedProps).toHaveLength(1);
+
+    await act(() => {
+      ReactNoop.flushSync(() => setCount(1));
+    });
+    expect(root).toMatchRenderedOutput('first: 1');
+    expect(committedProps[committedProps.length - 1]).toBe(initialProps);
+
+    // Abandon the suspended update and commit a different set of parent props.
+    await act(() => root.render(render('last', false)));
+    expect(root).toMatchRenderedOutput('last: 1');
+    expect(committedProps[committedProps.length - 1]).not.toBe(initialProps);
+    expect(initialProps.label).toBe('first');
   });
 
   it('should work without a ref to be forwarded', async () => {
